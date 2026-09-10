@@ -22,15 +22,30 @@ OCR_LANGUAGES = ["en"]
 OCR_GPU = os.environ.get("SMART_GATE_OCR_GPU", "0") == "1"
 MIN_OCR_CONFIDENCE = float(os.environ.get("SMART_GATE_MIN_OCR_CONF", "0.22"))
 
-# Continuous auto-scan (real-time)
-# How often to run OCR while live (seconds). CPU EasyOCR is slow — 1.5–2.5s is practical.
-AUTO_SCAN_INTERVAL = float(os.environ.get("SMART_GATE_SCAN_INTERVAL", "1.8"))
+# Trigger mode: motion (road-camera style) | interval (legacy polling)
+TRIGGER_MODE = os.environ.get("SMART_GATE_TRIGGER", "motion").strip().lower()
+
+# Interval between OCR retries while a vehicle is still in the ROI (motion mode),
+# or between polls (interval mode). CPU EasyOCR is slow — 2.5–4s is practical.
+AUTO_SCAN_INTERVAL = float(os.environ.get("SMART_GATE_SCAN_INTERVAL", "2.8"))
 # Same plate won't be posted again within this window (prevents entry→instant exit).
-PLATE_COOLDOWN_SECONDS = float(os.environ.get("SMART_GATE_PLATE_COOLDOWN", "12"))
+PLATE_COOLDOWN_SECONDS = float(os.environ.get("SMART_GATE_PLATE_COOLDOWN", "20"))
 # Require N identical consecutive OCR reads before posting (reduces false positives).
 CONFIRM_READS = int(os.environ.get("SMART_GATE_CONFIRM_READS", "2"))
 # Default ON for real-time operation; disable with --no-auto
 AUTO_SCAN_ENABLED = os.environ.get("SMART_GATE_AUTO_SCAN", "1") != "0"
+# Skip OCR when green ROI has almost no edges (empty scene) — interval mode.
+ROI_MIN_EDGE_RATIO = float(os.environ.get("SMART_GATE_ROI_EDGE_MIN", "0.012"))
+
+# Motion trigger (road ANPR style)
+MOTION_DIFF_THRESHOLD = int(os.environ.get("SMART_GATE_MOTION_DIFF", "28"))
+MOTION_MIN_CHANGE = float(os.environ.get("SMART_GATE_MOTION_MIN", "0.035"))
+# Wait after motion starts so the plate is centered / sharp before OCR.
+MOTION_SETTLE_SECONDS = float(os.environ.get("SMART_GATE_SETTLE", "0.6"))
+# Frames without motion required before accepting the next vehicle.
+MOTION_CLEAR_FRAMES = int(os.environ.get("SMART_GATE_CLEAR_FRAMES", "18"))
+# Max OCR attempts per vehicle passage (then wait until lane clears).
+MAX_OCR_PER_PASSAGE = int(os.environ.get("SMART_GATE_OCR_PER_PASS", "4"))
 
 # UI / capture
 WINDOW_NAME = "Smart Gate CV Scanner"

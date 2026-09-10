@@ -1,8 +1,9 @@
 # Smart Gate — CV Module
 # ======================
 #
-# Reads a webcam (or RTSP camera), runs EasyOCR when you press **S**,
-# cleans the detected plate text, and POSTs to Django:
+# Reads a webcam (or RTSP camera). Default mode is road-ANPR style:
+# motion in the green ROI → settle → OCR → POST once → wait until clear.
+# Cleans plate text and POSTs to Django:
 #
 #   POST {API}/api/scan/
 #   {"license_plate": "01A123AA", "camera_type": "auto"|"entry"|"exit"}
@@ -18,8 +19,11 @@
 #
 ## Run (backend must be up on :8000)
 #
-#   # Real-time auto scan (default) — plate in green box → auto POST
+#   # Auto (default): motion trigger → OCR → POST
 #   python scanner.py --type auto --api http://127.0.0.1:8000
+#
+#   # Legacy timed OCR (not recommended)
+#   python scanner.py --trigger interval
 #
 #   # Separate entry / exit cameras (production)
 #   python scanner.py --type entry --camera 0
@@ -30,13 +34,13 @@
 #
 ## Controls
 #
-#   (auto) continuously OCR green ROI every ~1.8s
+#   (auto/motion) vehicle enters green box → OCR → one POST per passage
 #   S — force immediate scan
 #   A — toggle auto on/off
 #   C — cycle camera type (auto / entry / exit)
 #   Q — quit
 #
-# Same plate is ignored for ~12s after a successful POST
+# Same plate is ignored for ~20s after a successful POST
 # (so entry is not instantly treated as exit on one camera).
 #
 ## Environment overrides
@@ -44,6 +48,7 @@
 #   SMART_GATE_API_URL=http://127.0.0.1:8000
 #   SMART_GATE_CAMERA_INDEX=0
 #   SMART_GATE_CAMERA_TYPE=entry
+#   SMART_GATE_TRIGGER=motion
 #   SMART_GATE_OCR_GPU=0
 #
 ## Zomin post tip

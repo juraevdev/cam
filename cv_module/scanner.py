@@ -2,8 +2,8 @@
 """
 Smart Gate — Real-time webcam plate scanner (OpenCV + EasyOCR)
 
-By default the scanner continuously watches the green ROI and, when a plate
-is stably detected, POSTs to Django /api/scan/ automatically (entry or exit).
+Road-camera style (default): motion in the green ROI triggers OCR once per
+vehicle passage, then waits until the lane clears. No continuous OCR spam.
 
 Controls
 --------
@@ -16,15 +16,17 @@ Usage
 -----
   python scanner.py
   python scanner.py --type auto --api http://127.0.0.1:8000
-  python scanner.py --type entry --camera 0          # entry lane
-  python scanner.py --type exit  --camera 1          # exit lane
-  python scanner.py --no-auto                        # manual S only
+  python scanner.py --trigger motion          # default: ANPR-style
+  python scanner.py --trigger interval        # legacy timed OCR
+  python scanner.py --type entry --camera 0
+  python scanner.py --no-auto                 # manual S only
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+import threading
 import time
 from typing import Any
 
@@ -41,19 +43,28 @@ from config import (
     CAMERA_INDEX,
     CAMERA_TYPE,
     CONFIRM_READS,
+    MAX_OCR_PER_PASSAGE,
     MIN_OCR_CONFIDENCE,
+    MOTION_CLEAR_FRAMES,
+    MOTION_DIFF_THRESHOLD,
+    MOTION_MIN_CHANGE,
+    MOTION_SETTLE_SECONDS,
     OCR_GPU,
     OCR_LANGUAGES,
     PLATE_COOLDOWN_SECONDS,
+    ROI_MIN_EDGE_RATIO,
     STREAM_ENABLED,
     STREAM_HOST,
     STREAM_PORT,
+    TRIGGER_MODE,
     WINDOW_NAME,
 )
 from mjpeg_server import FrameBuffer, start_mjpeg_server
+from motion import RoiMotionTrigger
 from plate_utils import extract_best_plate
 
 CAMERA_TYPES = ("auto", "entry", "exit")
+TRIGGER_MODES = ("motion", "interval")
 PLATE_ALLOWLIST = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ "
 
 
@@ -65,10 +76,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu", action="store_true", default=OCR_GPU)
     parser.add_argument("--min-conf", type=float, default=MIN_OCR_CONFIDENCE)
     parser.add_argument(
+        "--trigger",
+        choices=TRIGGER_MODES,
+        default=TRIGGER_MODE if TRIGGER_MODE in TRIGGER_MODES else "motion",
+        help="motion = road ANPR (default); interval = timed OCR",
+    )
+    parser.add_argument(
         "--interval",
         type=float,
         default=AUTO_SCAN_INTERVAL,
-        help="Seconds between automatic OCR attempts",
+        help="OCR retry / poll interval in seconds",
     )
     parser.add_argument(
         "--cooldown",
@@ -81,6 +98,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=CONFIRM_READS,
         help="Identical consecutive OCR hits required before POST",
+    )
+    parser.add_argument(
+        "--settle",
+        type=float,
+        default=MOTION_SETTLE_SECONDS,
+        help="Seconds to wait after motion before first OCR",
     )
     parser.add_argument(
         "--no-auto",
@@ -128,6 +151,11 @@ def roi_box(frame: np.ndarray) -> tuple[int, int, int, int]:
     return margin_x, margin_y, w - margin_x, h - margin_y
 
 
+def crop_roi(frame: np.ndarray) -> np.ndarray:
+    x1, y1, x2, y2 = roi_box(frame)
+    return frame[y1:y2, x1:x2]
+
+
 def preprocess_for_ocr(bgr: np.ndarray) -> np.ndarray:
     h, w = bgr.shape[:2]
     scale = 2.0 if max(h, w) < 900 else 1.5
@@ -139,6 +167,17 @@ def preprocess_for_ocr(bgr: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(cv2.merge([l2, a, b]), cv2.COLOR_LAB2BGR)
 
 
+def roi_has_content(frame: np.ndarray, min_edge_ratio: float = ROI_MIN_EDGE_RATIO) -> bool:
+    """Cheap gate: skip full OCR when the green box looks empty (interval mode)."""
+    crop = crop_roi(frame)
+    if crop.size == 0:
+        return True
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    small = cv2.resize(gray, (160, 90), interpolation=cv2.INTER_AREA)
+    edges = cv2.Canny(small, 60, 140)
+    return float(np.count_nonzero(edges)) / float(edges.size) >= min_edge_ratio
+
+
 def run_ocr(
     reader: easyocr.Reader,
     frame: np.ndarray,
@@ -146,8 +185,7 @@ def run_ocr(
     *,
     roi_only: bool = True,
 ) -> tuple[str | None, list[dict[str, Any]]]:
-    x1, y1, x2, y2 = roi_box(frame)
-    crop = frame[y1:y2, x1:x2]
+    crop = crop_roi(frame)
     if crop.size == 0:
         crop = frame
 
@@ -187,6 +225,8 @@ def draw_overlay(
     last_plate: str | None,
     last_action: str | None,
     auto_on: bool,
+    trigger: str,
+    motion_score: float = 0.0,
 ) -> np.ndarray:
     out = frame.copy()
     h, w = out.shape[:2]
@@ -195,20 +235,21 @@ def draw_overlay(
     cv2.rectangle(out, (0, 0), (w, 78), (15, 23, 42), -1)
     cv2.putText(
         out,
-        f"Smart Gate CV [{mode}]  |  [S] force  [A] auto  [C] type  [Q] quit",
+        f"Smart Gate CV [{mode}/{trigger}]  |  [S] force  [A] auto  [C] type  [Q] quit",
         (16, 28),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.58,
+        0.55,
         (204, 251, 241),
         2,
         cv2.LINE_AA,
     )
     cv2.putText(
         out,
-        f"type={camera_type}   plate={last_plate or '-'}   action={last_action or '-'}",
+        f"type={camera_type}   plate={last_plate or '-'}   action={last_action or '-'}"
+        + (f"   motion={motion_score:.0%}" if trigger == "motion" else ""),
         (16, 58),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
+        0.52,
         (226, 232, 240),
         1,
         cv2.LINE_AA,
@@ -271,16 +312,22 @@ def main() -> int:
     args = parse_args()
     scan_url = f"{args.api.rstrip('/')}/api/scan/"
     auto_on = AUTO_SCAN_ENABLED and not args.no_auto
+    trigger = args.trigger
 
     print("=" * 60)
-    print("Smart Gate CV Scanner (real-time)")
+    print("Smart Gate CV Scanner (road-camera style)")
     print(f"  camera   : {args.camera}")
     print(f"  type     : {args.type}")
     print(f"  API      : {scan_url}")
     print(f"  auto     : {auto_on}")
-    print(f"  interval : {args.interval}s")
+    print(f"  trigger  : {trigger}")
+    print(f"  interval : {args.interval}s (retry while vehicle present)")
     print(f"  cooldown : {args.cooldown}s")
     print(f"  confirm  : {args.confirm} reads")
+    if trigger == "motion":
+        print(f"  settle   : {args.settle}s")
+        print(f"  clear    : {MOTION_CLEAR_FRAMES} frames")
+        print(f"  max OCR  : {MAX_OCR_PER_PASSAGE}/passage")
     stream_on = STREAM_ENABLED and not args.no_stream
     print(f"  stream   : {'on' if stream_on else 'off'} (:{args.stream_port})")
     print("=" * 60)
@@ -301,13 +348,18 @@ def main() -> int:
     if stream_on:
         start_mjpeg_server(frame_buffer, host=STREAM_HOST, port=args.stream_port)
 
+    motion = RoiMotionTrigger(
+        diff_threshold=MOTION_DIFF_THRESHOLD,
+        min_change_ratio=MOTION_MIN_CHANGE,
+    )
+
     camera_type = args.type
     last_plate: str | None = None
     last_action: str | None = None
     status_line = (
-        "AUTO: place plate in green box"
-        if auto_on
-        else "MANUAL: press S to scan"
+        "AUTO: waiting for vehicle in green box"
+        if auto_on and trigger == "motion"
+        else ("AUTO: place plate in green box" if auto_on else "MANUAL: press S to scan")
     )
 
     last_ocr_at = 0.0
@@ -315,6 +367,117 @@ def main() -> int:
     pending_plate: str | None = None
     pending_count = 0
     busy = False
+    ocr_lock = threading.Lock()
+    ocr_result: dict[str, Any] | None = None
+    motion_score = 0.0
+
+    # Motion passage state machine: idle → capturing → waiting_clear → idle
+    passage_state = "idle"
+    settle_until = 0.0
+    ocr_attempts = 0
+    vehicle_posted = False
+    clear_streak = 0
+
+    def start_ocr(frame_bgr: np.ndarray, *, force: bool) -> None:
+        nonlocal busy, status_line, ocr_attempts
+
+        def worker() -> None:
+            nonlocal ocr_result, busy, last_ocr_at
+            try:
+                plate, hits = run_ocr(
+                    reader,
+                    frame_bgr,
+                    args.min_conf,
+                    roi_only=not force,
+                )
+                with ocr_lock:
+                    ocr_result = {"plate": plate, "hits": hits, "force": force}
+            except Exception as exc:  # noqa: BLE001 — keep UI alive
+                print(f"[OCR] error: {exc}")
+                with ocr_lock:
+                    ocr_result = {
+                        "plate": None,
+                        "hits": [],
+                        "force": force,
+                        "error": str(exc),
+                    }
+            finally:
+                last_ocr_at = time.time()
+                busy = False
+
+        busy = True
+        if not force and trigger == "motion":
+            ocr_attempts += 1
+        status_line = "OCR scanning..."
+        threading.Thread(target=worker, daemon=True).start()
+
+    def handle_ocr_finished(finished: dict[str, Any]) -> None:
+        nonlocal pending_plate, pending_count, last_plate, last_action
+        nonlocal status_line, vehicle_posted, passage_state
+
+        plate = finished.get("plate")
+        hits = finished.get("hits") or []
+        force_done = bool(finished.get("force"))
+        if plate or hits:
+            print(f"[OCR] hits={len(hits)} plate={plate!r}")
+            for hit in hits[:6]:
+                print(f"       conf={hit['confidence']:.2f} text={hit['text']!r}")
+
+        now = time.time()
+        if not plate:
+            pending_plate = None
+            pending_count = 0
+            if trigger == "motion" and passage_state == "capturing":
+                if ocr_attempts >= MAX_OCR_PER_PASSAGE:
+                    status_line = "No plate — wait until vehicle leaves"
+                    passage_state = "waiting_clear"
+                else:
+                    status_line = f"No plate ({ocr_attempts}/{MAX_OCR_PER_PASSAGE}) — retrying"
+            else:
+                status_line = "Watching… (no plate in ROI)"
+            return
+
+        cooled_until = plate_cooldown.get(plate, 0.0)
+        if not force_done and now < cooled_until:
+            remaining = int(cooled_until - now)
+            status_line = f"{plate} on cooldown ({remaining}s)"
+            if trigger == "motion":
+                passage_state = "waiting_clear"
+                vehicle_posted = True
+            return
+
+        if force_done:
+            confirm_ok = True
+            pending_plate = None
+            pending_count = 0
+        else:
+            if plate == pending_plate:
+                pending_count += 1
+            else:
+                pending_plate = plate
+                pending_count = 1
+            confirm_ok = pending_count >= max(1, args.confirm)
+            status_line = f"Seen {plate} ({pending_count}/{args.confirm})"
+
+        if not confirm_ok:
+            return
+
+        last_plate = plate
+        status_line = f"Posting {plate}..."
+        line, action, _data = post_plate(
+            plate,
+            camera_type=camera_type,
+            scan_url=scan_url,
+        )
+        last_action = action
+        status_line = line
+        plate_cooldown[plate] = now + args.cooldown
+        pending_plate = None
+        pending_count = 0
+        vehicle_posted = True
+        if trigger == "motion":
+            passage_state = "waiting_clear"
+            status_line = f"{line} — wait for clear"
 
     try:
         while True:
@@ -324,7 +487,23 @@ def main() -> int:
                 time.sleep(0.05)
                 continue
 
-            # Publish annotated preview to dashboard MJPEG clients
+            now = time.time()
+            present = False
+            if trigger == "motion":
+                present, motion_score = motion.update(crop_roi(frame))
+                if present:
+                    clear_streak = 0
+                else:
+                    clear_streak += 1
+
+            finished: dict[str, Any] | None = None
+            with ocr_lock:
+                if ocr_result is not None:
+                    finished = ocr_result
+                    ocr_result = None
+            if finished is not None:
+                handle_ocr_finished(finished)
+
             preview = draw_overlay(
                 frame,
                 camera_type=camera_type,
@@ -332,13 +511,12 @@ def main() -> int:
                 last_plate=last_plate,
                 last_action=last_action,
                 auto_on=auto_on,
+                trigger=trigger,
+                motion_score=motion_score,
             )
             if stream_on:
                 frame_buffer.update(preview)
-
-            now = time.time()
-            display = preview
-            cv2.imshow(WINDOW_NAME, display)
+            cv2.imshow(WINDOW_NAME, preview)
 
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
@@ -357,82 +535,72 @@ def main() -> int:
                 continue
 
             force = key == ord("s")
-            due = auto_on and (now - last_ocr_at) >= args.interval
-
-            if busy or (not force and not due):
+            if force and not busy:
+                start_ocr(frame.copy(), force=True)
                 continue
 
-            busy = True
-            last_ocr_at = now
-            status_line = "OCR scanning..."
-            scanning_preview = draw_overlay(
-                frame,
-                camera_type=camera_type,
-                status_line=status_line,
-                last_plate=last_plate,
-                last_action=last_action,
-                auto_on=auto_on,
-            )
-            if stream_on:
-                frame_buffer.update(scanning_preview)
-            cv2.imshow(WINDOW_NAME, scanning_preview)
-            cv2.waitKey(1)
-
-            plate, hits = run_ocr(
-                reader,
-                frame,
-                args.min_conf,
-                roi_only=not force,
-            )
-            print(f"[OCR] hits={len(hits)} plate={plate!r}")
-            for hit in hits[:6]:
-                print(f"       conf={hit['confidence']:.2f} text={hit['text']!r}")
-
-            if not plate:
-                pending_plate = None
-                pending_count = 0
-                status_line = "Watching… (no plate in ROI)"
-                busy = False
+            if busy or not auto_on:
                 continue
 
-            cooled_until = plate_cooldown.get(plate, 0.0)
-            if not force and now < cooled_until:
-                remaining = int(cooled_until - now)
-                status_line = f"{plate} on cooldown ({remaining}s)"
-                busy = False
+            # ---- Motion trigger (road ANPR) ----
+            if trigger == "motion":
+                if passage_state == "idle":
+                    if present:
+                        passage_state = "capturing"
+                        settle_until = now + max(0.0, args.settle)
+                        ocr_attempts = 0
+                        vehicle_posted = False
+                        pending_plate = None
+                        pending_count = 0
+                        status_line = "Vehicle detected — settling…"
+                        print("[TRIGGER] vehicle entered ROI")
+                    else:
+                        if status_line.startswith(("OCR", "No plate", "Seen", "Posting")):
+                            pass
+                        elif "wait" not in status_line.lower():
+                            status_line = "Waiting for vehicle…"
+
+                elif passage_state == "capturing":
+                    if clear_streak >= MOTION_CLEAR_FRAMES:
+                        passage_state = "idle"
+                        status_line = "Waiting for vehicle…"
+                        print("[TRIGGER] left before read — reset")
+                        continue
+                    if vehicle_posted:
+                        passage_state = "waiting_clear"
+                        continue
+                    if now < settle_until:
+                        continue
+                    if ocr_attempts >= MAX_OCR_PER_PASSAGE:
+                        passage_state = "waiting_clear"
+                        status_line = "No plate — wait until vehicle leaves"
+                        continue
+                    if (now - last_ocr_at) >= args.interval:
+                        start_ocr(frame.copy(), force=False)
+
+                elif passage_state == "waiting_clear":
+                    if clear_streak >= MOTION_CLEAR_FRAMES:
+                        passage_state = "idle"
+                        ocr_attempts = 0
+                        vehicle_posted = False
+                        pending_plate = None
+                        pending_count = 0
+                        status_line = "Ready — next vehicle"
+                        print("[TRIGGER] lane clear — ready")
+                    else:
+                        if not status_line.endswith("clear") and "wait" not in status_line.lower():
+                            status_line = "Wait until vehicle leaves…"
                 continue
 
-            if force:
-                # Manual force: post immediately
-                confirm_ok = True
-                pending_plate = None
-                pending_count = 0
-            else:
-                if plate == pending_plate:
-                    pending_count += 1
-                else:
-                    pending_plate = plate
-                    pending_count = 1
-                confirm_ok = pending_count >= max(1, args.confirm)
-                status_line = f"Seen {plate} ({pending_count}/{args.confirm})"
-
-            if not confirm_ok:
-                busy = False
+            # ---- Legacy interval polling ----
+            due = (now - last_ocr_at) >= args.interval
+            if not due:
                 continue
-
-            last_plate = plate
-            status_line = f"Posting {plate}..."
-            line, action, _data = post_plate(
-                plate,
-                camera_type=camera_type,
-                scan_url=scan_url,
-            )
-            last_action = action
-            status_line = line
-            plate_cooldown[plate] = now + args.cooldown
-            pending_plate = None
-            pending_count = 0
-            busy = False
+            if not roi_has_content(frame):
+                last_ocr_at = now
+                status_line = "Watching… (ROI empty)"
+                continue
+            start_ocr(frame.copy(), force=False)
 
     finally:
         cap.release()
