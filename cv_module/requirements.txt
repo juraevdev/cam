@@ -1,0 +1,19 @@
+# Smart Gate — CV module dependencies
+# Install on Ubuntu:
+#   sudo apt update
+#   sudo apt install -y python3-pip python3-venv libgl1 libglib2.0-0
+#   python3 -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements.txt
+#
+# IMPORTANT: EasyOCR pulls opencv-python-headless (no imshow).
+# After install, force the GUI build:
+#   pip uninstall -y opencv-python-headless
+#   pip install --force-reinstall opencv-python
+
+easyocr>=1.7
+numpy>=1.24
+requests>=2.31
+Pillow>=10.0
+torch>=2.0
+torchvision>=0.15
+opencv-python>=4.8
